@@ -1,0 +1,107 @@
+networks:
+  traefik:
+    name: traefik
+  idp-internal:
+    name: idp-internal
+
+volumes:
+  traefik_letsencrypt:
+  rabbitmq_data:
+
+services:
+  traefik:
+    image: traefik:v3.1
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - --api.dashboard=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=traefik
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      # Staging: certs não confiáveis pelo browser, mas sem rate-limit. Remova esta linha para produção.
+      - --certificatesresolvers.letsencrypt.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_letsencrypt:/letsencrypt
+    networks:
+      - traefik
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dashboard.rule=Host(`traefik.${IDP_BASE_DOMAIN}`)
+      - traefik.http.routers.dashboard.entrypoints=websecure
+      - traefik.http.routers.dashboard.tls.certresolver=letsencrypt
+      - traefik.http.routers.dashboard.service=api@internal
+      - traefik.http.routers.dashboard.middlewares=dashboard-auth
+      - traefik.http.middlewares.dashboard-auth.basicauth.users=${TRAEFIK_DASHBOARD_USERS}
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: idp-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - idp-internal
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: idp-api
+    restart: unless-stopped
+    environment:
+      IDP_API_TOKEN: ${IDP_API_TOKEN}
+      IDP_BASE_DOMAIN: ${IDP_BASE_DOMAIN}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+      PORT: "8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - traefik
+      - idp-internal
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik
+      - traefik.http.routers.idp-api.rule=Host(`api.${IDP_BASE_DOMAIN}`)
+      - traefik.http.routers.idp-api.entrypoints=websecure
+      - traefik.http.routers.idp-api.tls.certresolver=letsencrypt
+      - traefik.http.services.idp-api.loadbalancer.server.port=8080
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: idp-worker
+    restart: unless-stopped
+    environment:
+      IDP_BASE_DOMAIN: ${IDP_BASE_DOMAIN}
+      IDP_TRAEFIK_NETWORK: traefik
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    # Necessário para o worker criar/gerenciar containers de apps deployados.
+    # Equivale a root no host — aceitável para POC, endurecer com docker-socket-proxy depois.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - idp-internal
