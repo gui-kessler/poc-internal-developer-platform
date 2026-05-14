@@ -11,6 +11,7 @@ import (
 
 	"github.com/ixcsoft/idp/api/handler"
 	"github.com/ixcsoft/idp/api/middleware"
+	"github.com/ixcsoft/idp/api/store"
 	"github.com/ixcsoft/idp/shared/queue"
 )
 
@@ -19,17 +20,53 @@ func main() {
 
 	token := mustEnv(log, "IDP_API_TOKEN")
 	rabbitURL := mustEnv(log, "RABBITMQ_URL")
+	baseDomain := mustEnv(log, "IDP_BASE_DOMAIN")
 	port := envOr("PORT", "8080")
 
-	q, err := queue.Dial(rabbitURL)
+	qc, err := queue.Dial(rabbitURL)
 	if err != nil {
 		log.Error("rabbitmq connect failed", "err", err)
 		os.Exit(1)
 	}
-	defer q.Close()
+	defer qc.Close()
 	log.Info("rabbitmq connected")
 
-	deploy := handler.NewDeploy(q, log)
+	declCh, err := qc.Channel()
+	if err != nil {
+		log.Error("open channel failed", "err", err)
+		os.Exit(1)
+	}
+	if err := queue.DeclareTopology(declCh); err != nil {
+		log.Error("declare topology failed", "err", err)
+		os.Exit(1)
+	}
+	_ = declCh.Close()
+	log.Info("topology declared")
+
+	publishCh, err := qc.Channel()
+	if err != nil {
+		log.Error("open publish channel failed", "err", err)
+		os.Exit(1)
+	}
+	defer publishCh.Close()
+
+	consumeCh, err := qc.Channel()
+	if err != nil {
+		log.Error("open consume channel failed", "err", err)
+		os.Exit(1)
+	}
+	defer consumeCh.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st := store.New()
+	if err := store.Consume(ctx, consumeCh, st, log); err != nil {
+		log.Error("status consumer failed", "err", err)
+		os.Exit(1)
+	}
+
+	deploy := handler.NewDeploy(publishCh, st, baseDomain, log)
 	authed := middleware.Bearer(token)
 
 	mux := http.NewServeMux()
@@ -55,10 +92,11 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	log.Info("shutting down")
+	cancel()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
+	sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer scancel()
+	_ = srv.Shutdown(sctx)
 }
 
 func mustEnv(log *slog.Logger, k string) string {

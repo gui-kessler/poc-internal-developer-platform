@@ -6,7 +6,6 @@ import (
 
 type Client struct {
 	conn *amqp.Connection
-	ch   *amqp.Channel
 }
 
 func Dial(url string) (*Client, error) {
@@ -14,20 +13,17 @@ func Dial(url string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	ch, err := conn.Channel()
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	return &Client{conn: conn, ch: ch}, nil
+	return &Client{conn: conn}, nil
 }
 
-func (c *Client) Channel() *amqp.Channel { return c.ch }
+// Channel opens a fresh AMQP channel. Cada finalidade (publicar trabalho,
+// publicar status, consumir status, consumir trabalho) deve usar um canal
+// dedicado — canais AMQP têm restrições de concorrência.
+func (c *Client) Channel() (*amqp.Channel, error) {
+	return c.conn.Channel()
+}
 
 func (c *Client) Close() error {
-	if c.ch != nil {
-		_ = c.ch.Close()
-	}
 	if c.conn != nil {
 		return c.conn.Close()
 	}
